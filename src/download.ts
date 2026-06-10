@@ -17,6 +17,7 @@ class DownloadTask {
   status: "pending" | "downloading" | "done" | "error" = "pending";
   res: ReturnType<typeof utils.exec>;
   errorMessage: string | null = null;
+  warningMessage: string | null = null;
   downloadedBytes: number = 0;
   totalBytes: number = 0;
   eta: number | null = null;
@@ -30,6 +31,7 @@ class DownloadTask {
     public jsRuntime: string,
     public format: string | null,
     public ytdlOptions: string[],
+    public ffmpegLocation: string | null,
   ) {}
 
   get dest() {
@@ -39,9 +41,14 @@ class DownloadTask {
   private get args() {
     const args: string[] = [];
     args.push("-P", this.destFolder);
-    // args.push("--format", this.format);
+    if (this.format) {
+      args.push("--format", this.format);
+    }
     if (this.jsRuntime) {
       args.push("--js-runtimes", this.jsRuntime);
+    }
+    if (this.ffmpegLocation) {
+      args.push("--ffmpeg-location", this.ffmpegLocation);
     }
     args.push(...this.ytdlOptions);
     args.push(
@@ -97,6 +104,7 @@ class DownloadTask {
       status: this.status,
       start: this.startTime.toString(),
       error: this.errorMessage,
+      warning: this.warningMessage,
       dl: formatFileSize(this.downloadedBytes),
       total: formatFileSize(this.totalBytes),
       eta: formatSeconds(this.eta),
@@ -127,21 +135,69 @@ function getDownloadOptions(): string[] {
   return args;
 }
 
-export async function downloadVideo(url: string, player: string) {
-  // const hasFFmpeg =
-  //   (await utils.exec("/bin/bash", ["-c", "'which ffmpeg'"])).status === 0;
-  // const format = hasFFmpeg ? "bestvideo+bestaudio/best" : "best";
-  // console.log(`FFmpeg found: ${hasFFmpeg}; using format: ${format}`);
-  const format = null;
+async function findFFmpegLocation(): Promise<string | null> {
+  if (opt.ffmpeg_path) {
+    if (utils.fileInPath(opt.ffmpeg_path)) {
+      const resolvedPath = utils.resolvePath(opt.ffmpeg_path);
+      console.log(`Found ffmpeg from preferences; using ${resolvedPath}`);
+      return resolvedPath;
+    }
+    console.warn(`Configured ffmpeg path was not found: ${opt.ffmpeg_path}`);
+  }
 
+  const which = await utils.exec("/usr/bin/which", ["ffmpeg"]);
+  const whichPath = which.stdout.trim();
+  if (which.status === 0 && whichPath) {
+    console.log(`Found ffmpeg using which; using ${whichPath}`);
+    return whichPath;
+  }
+
+  const candidates = [
+    "/opt/homebrew/bin/ffmpeg",
+    "/usr/local/bin/ffmpeg",
+    "/opt/local/bin/ffmpeg",
+    "/sw/bin/ffmpeg",
+  ];
+  for (const candidate of candidates) {
+    if (utils.fileInPath(candidate)) {
+      console.log(`Found ffmpeg; using ${candidate}`);
+      return candidate;
+    }
+  }
+
+  console.warn("ffmpeg was not found; yt-dlp may be unable to merge best video and audio formats");
+  return null;
+}
+
+function formatNeedsFFmpeg(format: string | null): boolean {
+  return !!format && format.includes("+");
+}
+
+export async function downloadVideo(url: string, player: string) {
   const { path, jsRuntime } = await findBinary();
   const resolvedJsRuntime = jsRuntime ? utils.resolvePath(jsRuntime) : "";
   const ytdlOptions = getDownloadOptions();
-  const filenameArgs = [...ytdlOptions];
+  const ffmpegLocation = await findFFmpegLocation();
+  let format = opt.format;
+  if (!ffmpegLocation && formatNeedsFFmpeg(format)) {
+    console.warn(`ffmpeg was not found; falling back from ${format} to best`);
+    global.postMessage(
+      player,
+      "downloadWarning",
+      "ffmpeg not found; downloading lower-quality single-file format",
+    );
+    format = "best";
+  }
+  console.log(`Using download format: ${format}`);
+
+  const filenameArgs = ["--format", format];
   if (resolvedJsRuntime) {
     filenameArgs.push("--js-runtimes", resolvedJsRuntime);
   }
-  filenameArgs.push("--get-filename", "--", url);
+  if (ffmpegLocation) {
+    filenameArgs.push("--ffmpeg-location", ffmpegLocation);
+  }
+  filenameArgs.push(...ytdlOptions, "--get-filename", "--", url);
   const filename = (await utils.exec(path, filenameArgs)).stdout.replaceAll("\n", "");
   console.log(filename);
 
@@ -156,7 +212,12 @@ export async function downloadVideo(url: string, player: string) {
     resolvedJsRuntime,
     format,
     ytdlOptions,
+    ffmpegLocation,
   );
+  if (!ffmpegLocation && formatNeedsFFmpeg(opt.format)) {
+    task.warningMessage =
+      "ffmpeg not found; downloading lower-quality single-file format. Set the ffmpeg path in plugin preferences to enable best video and audio downloads.";
+  }
   tasks.push(task);
   task.start();
 }
